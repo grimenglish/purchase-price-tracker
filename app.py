@@ -101,23 +101,23 @@ def normalize_text(value: str) -> str:
 
 
 def find_previous_price(item_name, unit, vendor_name, purchase_date):
+    """
+    품목별 탭 구조에 맞춰 같은 품목명 기준으로만 직전 매입가를 비교합니다.
+    예: 엿기름이면 규격/거래처가 비어 있어도 직전 엿기름 가격과 비교.
+    """
     conn = get_conn()
     cur = conn.cursor()
 
     item_name = normalize_text(item_name)
-    unit = normalize_text(unit)
-    vendor_name = normalize_text(vendor_name)
 
     cur.execute("""
         SELECT price
         FROM purchase_records
         WHERE item_name = ?
-          AND IFNULL(unit, '') = ?
-          AND IFNULL(vendor_name, '') = ?
           AND purchase_date <= ?
         ORDER BY purchase_date DESC, id DESC
         LIMIT 1
-    """, (item_name, unit, vendor_name, purchase_date))
+    """, (item_name, purchase_date))
 
     row = cur.fetchone()
     conn.close()
@@ -423,7 +423,7 @@ with tab_input:
             elif change_status == "동일":
                 st.caption("직전 매입가와 동일합니다.")
             else:
-                st.caption("해당 품목·규격·거래처 기준 첫 기록입니다.")
+                st.caption("해당 품목 기준 첫 기록입니다.")
 
 
 # -----------------------------
@@ -578,4 +578,4 @@ with tab_dashboard:
         )
 
 
-st.caption("기준: 같은 품목명 + 같은 규격/단위 + 같은 거래처명 기준으로 직전 매입가와 비교합니다.")
+st.caption("기준: 같은 품목명 기준으로 직전 매입가와 비교합니다.")
