@@ -9,6 +9,16 @@ import streamlit as st
 APP_TITLE = "매입가 변동 기록장부"
 DB_PATH = Path("purchase_records.db")
 
+ITEM_CATEGORIES = [
+    "쌀",
+    "엿기름",
+    "설탕",
+    "아이스팩 비닐",
+    "아이스박스",
+    "200ml 파우치",
+    "테이프",
+]
+
 
 # -----------------------------
 # 기본 설정
@@ -91,10 +101,6 @@ def normalize_text(value: str) -> str:
 
 
 def find_previous_price(item_name, unit, vendor_name, purchase_date):
-    """
-    같은 품목 + 같은 규격 + 같은 거래처 기준으로 직전 매입가 조회.
-    매입일이 같으면 id가 큰 최근 입력값 기준.
-    """
     conn = get_conn()
     cur = conn.cursor()
 
@@ -237,14 +243,89 @@ def format_percent(x):
     return f"{float(x):+.2f}%"
 
 
-def status_html(status):
-    if status == "상승":
-        return '<span class="up">상승</span>'
-    if status == "하락":
-        return '<span class="down">하락</span>'
-    if status == "동일":
-        return '<span class="same">동일</span>'
-    return '<span class="new">신규</span>'
+def sort_records(df, sort_option):
+    if sort_option == "가격 높은순":
+        return df.sort_values("매입가", ascending=False)
+    if sort_option == "상승률 높은순":
+        return df.sort_values("변동률", ascending=False, na_position="last")
+    if sort_option == "하락률 높은순":
+        return df.sort_values("변동률", ascending=True, na_position="last")
+    return df.sort_values(["매입일", "id"], ascending=[False, False])
+
+
+def render_record_table(source_df, tab_key, fixed_item=None):
+    filtered = source_df.copy()
+
+    if fixed_item and fixed_item != "전체":
+        filtered = filtered[filtered["품목명"] == fixed_item]
+
+    f1, f2, f3 = st.columns([1.2, 1, 1])
+
+    with f1:
+        vendor_keyword = st.text_input(
+            "거래처 검색",
+            placeholder="예: 농산",
+            key=f"vendor_{tab_key}"
+        )
+
+    with f2:
+        status_filter = st.selectbox(
+            "상태",
+            ["전체", "상승", "하락", "동일", "신규"],
+            key=f"status_{tab_key}"
+        )
+
+    with f3:
+        sort_option = st.selectbox(
+            "정렬",
+            ["최근 매입일순", "가격 높은순", "상승률 높은순", "하락률 높은순"],
+            key=f"sort_{tab_key}"
+        )
+
+    if vendor_keyword:
+        filtered = filtered[
+            filtered["거래처명"].fillna("").str.contains(vendor_keyword, case=False, na=False)
+        ]
+
+    if status_filter != "전체":
+        filtered = filtered[filtered["상태"] == status_filter]
+
+    filtered = sort_records(filtered, sort_option)
+
+    if filtered.empty:
+        st.info("해당 조건의 기록이 없습니다.")
+        return
+
+    summary1, summary2, summary3, summary4 = st.columns(4)
+    summary1.metric("기록 수", f"{len(filtered):,}건")
+    summary2.metric("상승", f"{int((filtered['상태'] == '상승').sum()):,}건")
+    summary3.metric("하락", f"{int((filtered['상태'] == '하락').sum()):,}건")
+
+    latest_price = filtered.iloc[0]["매입가"] if not filtered.empty else None
+    summary4.metric("최근 매입가", format_money(latest_price))
+
+    show_df = filtered.copy()
+    show_df["매입가"] = show_df["매입가"].apply(format_money)
+    show_df["직전매입가"] = show_df["직전매입가"].apply(format_money)
+    show_df["변동금액"] = show_df["변동금액"].apply(format_money)
+    show_df["변동률"] = show_df["변동률"].apply(format_percent)
+
+    st.dataframe(
+        show_df.drop(columns=["id"]),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    csv_name_item = fixed_item if fixed_item and fixed_item != "전체" else "전체"
+    csv = filtered.drop(columns=["id"]).to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        f"{csv_name_item} CSV 다운로드",
+        data=csv,
+        file_name=f"매입가_기록_{csv_name_item}_{date.today().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key=f"csv_{tab_key}"
+    )
 
 
 init_db()
@@ -272,13 +353,14 @@ with tab_input:
         c1, c2, c3 = st.columns([1.2, 1, 1])
 
         with c1:
-            item_name = st.text_input(
+            item_name = st.selectbox(
                 "품목명 *",
-                placeholder="예: 쌀, 엿기름, 단호박, 설탕"
+                ITEM_CATEGORIES,
+                help="품목이 섞이지 않도록 고정 항목 중에서 선택합니다."
             )
             unit = st.text_input(
                 "규격/단위",
-                placeholder="예: 20kg, 1박스, 1포대"
+                placeholder="예: 20kg, 1박스, 1포대, 1롤"
             )
 
         with c2:
@@ -308,9 +390,7 @@ with tab_input:
         submitted = st.form_submit_button("저장하기", use_container_width=True)
 
     if submitted:
-        if not normalize_text(item_name):
-            st.error("품목명은 필수입니다.")
-        elif price <= 0:
+        if price <= 0:
             st.error("매입가는 0원보다 커야 합니다.")
         else:
             previous_price, change_amount, change_percent, change_status = insert_record({
@@ -357,81 +437,36 @@ with tab_list:
     if df.empty:
         st.info("아직 저장된 기록이 없습니다.")
     else:
-        f1, f2, f3, f4 = st.columns([1.2, 1.2, 1, 1])
+        tab_names = ["전체"] + ITEM_CATEGORIES
+        item_tabs = st.tabs(tab_names)
 
-        with f1:
-            keyword = st.text_input("품목명 검색", placeholder="예: 쌀")
-        with f2:
-            vendor_keyword = st.text_input("거래처 검색", placeholder="예: 농산")
-        with f3:
-            status_filter = st.selectbox(
-                "상태",
-                ["전체", "상승", "하락", "동일", "신규"]
-            )
-        with f4:
-            sort_option = st.selectbox(
-                "정렬",
-                ["최근 매입일순", "가격 높은순", "상승률 높은순", "하락률 높은순"]
-            )
+        for idx, tab_name in enumerate(tab_names):
+            with item_tabs[idx]:
+                st.markdown(f"### {tab_name} 기록")
+                render_record_table(df, tab_key=f"tab_{idx}", fixed_item=tab_name)
 
-        filtered = df.copy()
-
-        if keyword:
-            filtered = filtered[
-                filtered["품목명"].fillna("").str.contains(keyword, case=False, na=False)
-            ]
-
-        if vendor_keyword:
-            filtered = filtered[
-                filtered["거래처명"].fillna("").str.contains(vendor_keyword, case=False, na=False)
-            ]
-
-        if status_filter != "전체":
-            filtered = filtered[filtered["상태"] == status_filter]
-
-        if sort_option == "가격 높은순":
-            filtered = filtered.sort_values("매입가", ascending=False)
-        elif sort_option == "상승률 높은순":
-            filtered = filtered.sort_values("변동률", ascending=False, na_position="last")
-        elif sort_option == "하락률 높은순":
-            filtered = filtered.sort_values("변동률", ascending=True, na_position="last")
-        else:
-            filtered = filtered.sort_values(["매입일", "id"], ascending=[False, False])
-
-        show_df = filtered.copy()
-        show_df["매입가"] = show_df["매입가"].apply(format_money)
-        show_df["직전매입가"] = show_df["직전매입가"].apply(format_money)
-        show_df["변동금액"] = show_df["변동금액"].apply(format_money)
-        show_df["변동률"] = show_df["변동률"].apply(format_percent)
-
-        st.dataframe(
-            show_df.drop(columns=["id"]),
-            use_container_width=True,
-            hide_index=True
-        )
-
-        csv = filtered.drop(columns=["id"]).to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "CSV 다운로드",
-            data=csv,
-            file_name=f"매입가_기록_{date.today().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+        st.divider()
 
         with st.expander("기록 삭제"):
+            st.warning("삭제하면 복구가 어렵습니다. 아래 원본 ID를 확인하고 삭제하세요.")
+
             delete_id = st.number_input(
                 "삭제할 ID 입력",
                 min_value=1,
                 step=1,
-                help="표에는 ID가 숨겨져 있습니다. 필요하면 아래 원본 ID 표를 열어서 확인하세요."
+                key="delete_id_input"
             )
-            if st.button("선택 ID 삭제"):
+
+            if st.button("선택 ID 삭제", key="delete_button"):
                 delete_record(delete_id)
                 st.success("삭제 완료. 새로고침하면 반영됩니다.")
 
             st.caption("원본 ID 확인용")
-            st.dataframe(df[["id", "매입일", "품목명", "규격단위", "매입가", "거래처명"]], hide_index=True)
+            st.dataframe(
+                df[["id", "매입일", "품목명", "규격단위", "매입가", "거래처명", "메모"]],
+                hide_index=True,
+                use_container_width=True
+            )
 
 
 # -----------------------------
@@ -455,6 +490,42 @@ with tab_dashboard:
         m2.metric("상승 기록", f"{up_count:,}건")
         m3.metric("하락 기록", f"{down_count:,}건")
         m4.metric("신규 기록", f"{new_count:,}건")
+
+        st.divider()
+
+        st.markdown("#### 품목별 최근 매입가")
+        latest_rows = []
+        for item in ITEM_CATEGORIES:
+            item_df = df[df["품목명"] == item].copy()
+            if not item_df.empty:
+                item_df = item_df.sort_values(["매입일", "id"], ascending=[False, False])
+                row = item_df.iloc[0]
+                latest_rows.append({
+                    "품목명": item,
+                    "최근 매입일": row["매입일"],
+                    "최근 매입가": row["매입가"],
+                    "거래처명": row["거래처명"],
+                    "상태": row["상태"],
+                    "변동률": row["변동률"],
+                    "메모": row["메모"],
+                })
+            else:
+                latest_rows.append({
+                    "품목명": item,
+                    "최근 매입일": "-",
+                    "최근 매입가": None,
+                    "거래처명": "-",
+                    "상태": "-",
+                    "변동률": None,
+                    "메모": "",
+                })
+
+        latest_df = pd.DataFrame(latest_rows)
+        latest_show = latest_df.copy()
+        latest_show["최근 매입가"] = latest_show["최근 매입가"].apply(format_money)
+        latest_show["변동률"] = latest_show["변동률"].apply(format_percent)
+
+        st.dataframe(latest_show, use_container_width=True, hide_index=True)
 
         st.divider()
 
@@ -488,8 +559,7 @@ with tab_dashboard:
 
         st.markdown("#### 품목별 가격 흐름")
 
-        item_options = sorted(df["품목명"].dropna().unique().tolist())
-        selected_item = st.selectbox("품목 선택", item_options)
+        selected_item = st.selectbox("품목 선택", ITEM_CATEGORIES)
 
         item_df = df[df["품목명"] == selected_item].copy()
         item_df["매입일"] = pd.to_datetime(item_df["매입일"])
