@@ -1,505 +1,361 @@
-import sqlite3
-from pathlib import Path
-from datetime import date, datetime
+
+import re
+import io
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
+try:
+    import msoffcrypto
+except Exception:
+    msoffcrypto = None
 
-APP_TITLE = "매입가 변동 기록장부"
-DB_PATH = Path("purchase_records.db")
 
-
-# -----------------------------
-# 기본 설정
-# -----------------------------
 st.set_page_config(
-    page_title=APP_TITLE,
+    page_title="식혜명가 고객 재구매 분석",
     page_icon="📦",
     layout="wide",
 )
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.5rem;}
-.big-title {
-    font-size: 2rem;
-    font-weight: 800;
-    margin-bottom: 0.2rem;
+.block-container {padding-top: 2rem;}
+.kpi-card {
+    background: white;
+    border: 1px solid #ECECEC;
+    border-radius: 18px;
+    padding: 20px 22px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.04);
 }
-.sub-text {
-    color: #666;
-    margin-bottom: 1.2rem;
-}
-.card {
-    padding: 1rem;
-    border: 1px solid #eee;
-    border-radius: 14px;
-    background: #fafafa;
-}
-.up {color:#d92d20; font-weight:700;}
-.down {color:#1570ef; font-weight:700;}
-.same {color:#667085; font-weight:700;}
-.new {color:#12b76a; font-weight:700;}
+.kpi-title {color:#666;font-size:14px;margin-bottom:8px;}
+.kpi-value {font-size:30px;font-weight:800;color:#111;}
 </style>
 """, unsafe_allow_html=True)
 
-
-# -----------------------------
-# DB
-# -----------------------------
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+SMARTSTORE_PASSWORD = "1111"
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
+def normalize_phone(x):
+    if pd.isna(x):
+        return ""
+    return re.sub(r"[^0-9]", "", str(x))
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS purchase_records (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_name TEXT NOT NULL,
-        unit TEXT,
-        price INTEGER NOT NULL,
-        purchase_date TEXT NOT NULL,
-        vendor_name TEXT,
-        vendor_phone TEXT,
-        memo TEXT,
-        previous_price INTEGER,
-        change_amount INTEGER,
-        change_percent REAL,
-        change_status TEXT,
-        created_at TEXT NOT NULL
-    )
+
+def normalize_text(x):
+    if pd.isna(x):
+        return ""
+    return re.sub(r"\s+", " ", str(x)).strip()
+
+
+def normalize_address(x):
+    s = normalize_text(x)
+    s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def pick_col(df, candidates):
+    cols = list(df.columns)
+    exact = {str(c).strip(): c for c in cols}
+    for c in candidates:
+        if c in exact:
+            return exact[c]
+    for col in cols:
+        col_s = str(col).strip()
+        for c in candidates:
+            if c in col_s:
+                return col
+    return None
+
+
+def read_excel_file(uploaded_file):
+    raw = uploaded_file.getvalue()
+    name = uploaded_file.name
+
+    # 일반 xlsx/xls 먼저 시도
+    try:
+        return pd.read_excel(io.BytesIO(raw))
+    except Exception as first_error:
+        # 네이버 스마트스토어 암호화 xlsx 자동 해제
+        if msoffcrypto is None:
+            raise RuntimeError(
+                "암호화된 엑셀을 읽으려면 msoffcrypto-tool이 필요합니다. requirements.txt에 msoffcrypto-tool을 추가하세요."
+            )
+
+        try:
+            office = msoffcrypto.OfficeFile(io.BytesIO(raw))
+            office.load_key(password=SMARTSTORE_PASSWORD)
+            decrypted = io.BytesIO()
+            office.decrypt(decrypted)
+            decrypted.seek(0)
+            return pd.read_excel(decrypted)
+        except Exception as second_error:
+            raise RuntimeError(
+                f"엑셀을 읽지 못했습니다. 첫 오류: {first_error} / 암호해제 오류: {second_error}"
+            )
+
+
+def detect_market(filename, df):
+    name = filename.lower()
+    cols = set(map(str, df.columns))
+
+    if "delivery" in name or "coupang" in name or "쿠팡" in name:
+        return "쿠팡"
+    if "스마트스토어" in name or "smartstore" in name or "naver" in name or "네이버" in name:
+        return "네이버"
+
+    if "묶음배송번호" in cols or "노출상품명(옵션명)" in cols:
+        return "쿠팡"
+    if "상품주문번호" in cols or "수취인연락처1" in cols or "통합배송지" in cols:
+        return "네이버"
+    return "기타"
+
+
+def standardize(df, market, filename):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    order_date_col = pick_col(df, ["주문일시", "주문일", "결제일", "발주확인일", "송장출력일", "발송일"])
+    order_no_col = pick_col(df, ["상품주문번호", "주문번호", "묶음배송번호"])
+    receiver_col = pick_col(df, ["수취인명", "수취인이름", "수령인", "받는분", "수령자명"])
+    receiver_phone_col = pick_col(df, ["수취인연락처1", "수취인전화번호", "수취인연락처", "수령인전화번호"])
+    buyer_col = pick_col(df, ["구매자명", "구매자", "주문자명"])
+    buyer_phone_col = pick_col(df, ["구매자연락처", "구매자전화번호", "주문자연락처"])
+    address_col = pick_col(df, ["통합배송지", "수취인 주소", "배송지주소", "수취인주소", "주소"])
+    product_col = pick_col(df, ["상품명", "노출상품명(옵션명)", "등록상품명"])
+    qty_col = pick_col(df, ["수량", "구매수(수량)", "구매수량"])
+    amount_col = pick_col(df, ["최종 상품별 총 주문금액", "결제액", "결제금액", "정산예정금액", "상품별 총 주문금액"])
+
+    out = pd.DataFrame(index=df.index)
+    out["판매채널"] = market
+    out["원본파일"] = filename
+    out["주문번호"] = df[order_no_col].astype(str) if order_no_col else [f"{filename}-{i}" for i in df.index]
+    out["주문일"] = pd.to_datetime(df[order_date_col], errors="coerce") if order_date_col else pd.NaT
+    out["수취인"] = df[receiver_col].map(normalize_text) if receiver_col else ""
+    out["수취인전화"] = df[receiver_phone_col].map(normalize_phone) if receiver_phone_col else ""
+    out["구매자"] = df[buyer_col].map(normalize_text) if buyer_col else ""
+    out["구매자전화"] = df[buyer_phone_col].map(normalize_phone) if buyer_phone_col else ""
+    out["주소"] = df[address_col].map(normalize_address) if address_col else ""
+    out["상품명"] = df[product_col].map(normalize_text) if product_col else ""
+    out["수량"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(1).astype(int) if qty_col else 1
+    out["결제금액"] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0).astype(int) if amount_col else 0
+
+    name_key = out["수취인"].where(out["수취인"] != "", out["구매자"])
+    phone_key = out["수취인전화"].where(out["수취인전화"] != "", out["구매자전화"])
+
+    # 050 안심번호는 주문마다 바뀔 수 있으므로 이름+주소를 기본 고객키로 사용
+    out["고객키"] = name_key.fillna("").astype(str).str.strip() + "|" + out["주소"].fillna("").astype(str).str.strip()
+    out["전화포함고객키"] = name_key.fillna("").astype(str).str.strip() + "|" + phone_key.fillna("").astype(str).str.strip() + "|" + out["주소"].fillna("").astype(str).str.strip()
+
+    out = out[(name_key != "") | (out["주소"] != "") | (phone_key != "")]
+    return out
+
+
+def join_unique(series):
+    vals = []
+    for v in series:
+        v = str(v).strip()
+        if v and v.lower() != "nan" and v not in vals:
+            vals.append(v)
+    return ", ".join(vals)
+
+
+def to_excel_bytes(order_df, customer_df, summary_df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, index=False, sheet_name="요약")
+        customer_df.to_excel(writer, index=False, sheet_name="고객별분석")
+        order_df.to_excel(writer, index=False, sheet_name="주문정리")
+    output.seek(0)
+    return output.getvalue()
+
+
+st.title("📦 식혜명가 고객 재구매 분석")
+st.caption("쿠팡 DeliveryList / 네이버 스마트스토어 엑셀을 올리면 신규·재구매·VIP 고객을 자동 계산합니다.")
+
+with st.expander("사용법"):
+    st.write("""
+- 쿠팡: `DeliveryList...xlsx`
+- 네이버 스마트스토어: `스마트스토어_선택주문발주발송관리...xlsx`
+- 네이버 파일 비밀번호는 자동으로 `1111`을 사용합니다.
+- 고객 식별은 기본적으로 **수취인명 + 주소** 기준입니다. 쿠팡 050 안심번호가 매번 바뀌는 문제를 줄이기 위해서입니다.
     """)
 
-    conn.commit()
-    conn.close()
-
-
-def normalize_text(value: str) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def find_previous_price(item_name, unit, vendor_name, purchase_date):
-    """
-    같은 품목 + 같은 규격 + 같은 거래처 기준으로 직전 매입가 조회.
-    매입일이 같으면 id가 큰 최근 입력값 기준.
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-
-    item_name = normalize_text(item_name)
-    unit = normalize_text(unit)
-    vendor_name = normalize_text(vendor_name)
-
-    cur.execute("""
-        SELECT price
-        FROM purchase_records
-        WHERE item_name = ?
-          AND IFNULL(unit, '') = ?
-          AND IFNULL(vendor_name, '') = ?
-          AND purchase_date <= ?
-        ORDER BY purchase_date DESC, id DESC
-        LIMIT 1
-    """, (item_name, unit, vendor_name, purchase_date))
-
-    row = cur.fetchone()
-    conn.close()
-
-    return row[0] if row else None
-
-
-def calculate_change(current_price, previous_price):
-    if previous_price is None:
-        return None, None, "신규"
-
-    change_amount = int(current_price) - int(previous_price)
-
-    if previous_price == 0:
-        change_percent = None
-    else:
-        change_percent = (change_amount / previous_price) * 100
-
-    if change_amount > 0:
-        status = "상승"
-    elif change_amount < 0:
-        status = "하락"
-    else:
-        status = "동일"
-
-    return change_amount, change_percent, status
-
-
-def insert_record(data):
-    previous_price = find_previous_price(
-        data["item_name"],
-        data["unit"],
-        data["vendor_name"],
-        data["purchase_date"]
-    )
-
-    change_amount, change_percent, change_status = calculate_change(
-        data["price"],
-        previous_price
-    )
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO purchase_records (
-            item_name,
-            unit,
-            price,
-            purchase_date,
-            vendor_name,
-            vendor_phone,
-            memo,
-            previous_price,
-            change_amount,
-            change_percent,
-            change_status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        normalize_text(data["item_name"]),
-        normalize_text(data["unit"]),
-        int(data["price"]),
-        data["purchase_date"],
-        normalize_text(data["vendor_name"]),
-        normalize_text(data["vendor_phone"]),
-        normalize_text(data["memo"]),
-        previous_price,
-        change_amount,
-        change_percent,
-        change_status,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ))
-
-    conn.commit()
-    conn.close()
-
-    return previous_price, change_amount, change_percent, change_status
-
-
-def load_records():
-    conn = get_conn()
-    df = pd.read_sql_query("""
-        SELECT
-            id,
-            purchase_date AS 매입일,
-            item_name AS 품목명,
-            unit AS 규격단위,
-            price AS 매입가,
-            vendor_name AS 거래처명,
-            vendor_phone AS 연락처,
-            previous_price AS 직전매입가,
-            change_amount AS 변동금액,
-            change_percent AS 변동률,
-            change_status AS 상태,
-            memo AS 메모,
-            created_at AS 입력일시
-        FROM purchase_records
-        ORDER BY purchase_date DESC, id DESC
-    """, conn)
-    conn.close()
-    return df
-
-
-def delete_record(record_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM purchase_records WHERE id = ?", (record_id,))
-    conn.commit()
-    conn.close()
-
-
-def format_money(x):
-    if pd.isna(x) or x is None:
-        return "-"
-    return f"{int(x):,}원"
-
-
-def format_percent(x):
-    if pd.isna(x) or x is None:
-        return "-"
-    return f"{float(x):+.2f}%"
-
-
-def status_html(status):
-    if status == "상승":
-        return '<span class="up">상승</span>'
-    if status == "하락":
-        return '<span class="down">하락</span>'
-    if status == "동일":
-        return '<span class="same">동일</span>'
-    return '<span class="new">신규</span>'
-
-
-init_db()
-
-
-# -----------------------------
-# 화면
-# -----------------------------
-st.markdown(f'<div class="big-title">📦 {APP_TITLE}</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="sub-text">품목·거래처별 매입가를 기록하고 직전 매입가 대비 상승/하락률을 자동 계산합니다.</div>',
-    unsafe_allow_html=True
+uploaded_files = st.file_uploader(
+    "엑셀 파일 업로드",
+    type=["xlsx", "xls", "csv"],
+    accept_multiple_files=True,
 )
 
-tab_input, tab_list, tab_dashboard = st.tabs(["➕ 매입 기록", "📋 기록 조회", "📊 가격 분석"])
+if not uploaded_files:
+    st.info("쿠팡/네이버 송장 엑셀을 업로드하세요.")
+    st.stop()
 
+frames = []
+errors = []
 
-# -----------------------------
-# 입력 탭
-# -----------------------------
-with tab_input:
-    st.subheader("신규 매입 기록")
-
-    with st.form("purchase_form", clear_on_submit=False):
-        c1, c2, c3 = st.columns([1.2, 1, 1])
-
-        with c1:
-            item_name = st.text_input(
-                "품목명 *",
-                placeholder="예: 쌀, 엿기름, 단호박, 설탕"
-            )
-            unit = st.text_input(
-                "규격/단위",
-                placeholder="예: 20kg, 1박스, 1포대"
-            )
-
-        with c2:
-            price = st.number_input(
-                "매입가 *",
-                min_value=0,
-                step=100,
-                format="%d"
-            )
-            purchase_date = st.date_input("매입일", value=date.today())
-
-        with c3:
-            vendor_name = st.text_input(
-                "거래처명",
-                placeholder="예: 대구농산"
-            )
-            vendor_phone = st.text_input(
-                "거래처 연락처",
-                placeholder="예: 010-0000-0000"
-            )
-
-        memo = st.text_area(
-            "메모",
-            placeholder="예: 이번 달부터 단가 인상, 배송비 포함, 품질 좋음 등"
-        )
-
-        submitted = st.form_submit_button("저장하기", use_container_width=True)
-
-    if submitted:
-        if not normalize_text(item_name):
-            st.error("품목명은 필수입니다.")
-        elif price <= 0:
-            st.error("매입가는 0원보다 커야 합니다.")
+for f in uploaded_files:
+    try:
+        if f.name.lower().endswith(".csv"):
+            raw = pd.read_csv(f)
         else:
-            previous_price, change_amount, change_percent, change_status = insert_record({
-                "item_name": item_name,
-                "unit": unit,
-                "price": price,
-                "purchase_date": purchase_date.strftime("%Y-%m-%d"),
-                "vendor_name": vendor_name,
-                "vendor_phone": vendor_phone,
-                "memo": memo,
-            })
+            raw = read_excel_file(f)
 
-            st.success("저장 완료!")
+        market = detect_market(f.name, raw)
+        std = standardize(raw, market, f.name)
+        frames.append(std)
 
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("현재 매입가", f"{int(price):,}원")
-            r2.metric("직전 매입가", format_money(previous_price))
+        st.success(f"{f.name} 읽기 성공: {market} / {len(std):,}행")
 
-            if change_amount is None:
-                r3.metric("변동금액", "-")
-                r4.metric("변동률", "신규")
-            else:
-                r3.metric("변동금액", f"{change_amount:+,}원")
-                r4.metric("변동률", format_percent(change_percent))
+    except Exception as e:
+        errors.append((f.name, str(e)))
 
-            if change_status == "상승":
-                st.warning(f"직전 대비 {change_amount:+,}원, {change_percent:+.2f}% 상승했습니다.")
-            elif change_status == "하락":
-                st.info(f"직전 대비 {change_amount:+,}원, {change_percent:+.2f}% 하락했습니다.")
-            elif change_status == "동일":
-                st.caption("직전 매입가와 동일합니다.")
-            else:
-                st.caption("해당 품목·규격·거래처 기준 첫 기록입니다.")
+if errors:
+    for name, msg in errors:
+        st.error(f"{name}: {msg}")
 
+if not frames:
+    st.stop()
 
-# -----------------------------
-# 조회 탭
-# -----------------------------
-with tab_list:
-    st.subheader("매입 기록 조회")
+orders = pd.concat(frames, ignore_index=True)
+orders = orders.dropna(subset=["주문일"]).sort_values("주문일")
 
-    df = load_records()
+if orders.empty:
+    st.error("주문일을 찾지 못했습니다. 엑셀 컬럼 구조를 확인해야 합니다.")
+    st.stop()
 
-    if df.empty:
-        st.info("아직 저장된 기록이 없습니다.")
-    else:
-        f1, f2, f3, f4 = st.columns([1.2, 1.2, 1, 1])
+# 주문번호 기준 중복 상품행 정리
+group_cols = ["판매채널", "주문번호", "고객키", "전화포함고객키", "수취인", "수취인전화", "구매자", "구매자전화", "주소", "주문일"]
 
-        with f1:
-            keyword = st.text_input("품목명 검색", placeholder="예: 쌀")
-        with f2:
-            vendor_keyword = st.text_input("거래처 검색", placeholder="예: 농산")
-        with f3:
-            status_filter = st.selectbox(
-                "상태",
-                ["전체", "상승", "하락", "동일", "신규"]
-            )
-        with f4:
-            sort_option = st.selectbox(
-                "정렬",
-                ["최근 매입일순", "가격 높은순", "상승률 높은순", "하락률 높은순"]
-            )
+order_level = (
+    orders.groupby(group_cols, dropna=False)
+    .agg({
+        "상품명": join_unique,
+        "수량": "sum",
+        "결제금액": "sum",
+    })
+    .reset_index()
+)
 
-        filtered = df.copy()
+order_level = order_level.rename(columns={"수량": "총수량"})
 
-        if keyword:
-            filtered = filtered[
-                filtered["품목명"].fillna("").str.contains(keyword, case=False, na=False)
-            ]
+use_phone = st.toggle(
+    "전화번호까지 포함해서 더 엄격하게 고객 구분",
+    value=False,
+    help="기본은 이름+주소 기준입니다. 050 안심번호 때문에 쿠팡 재구매가 분리되는 것을 막기 위함입니다.",
+)
 
-        if vendor_keyword:
-            filtered = filtered[
-                filtered["거래처명"].fillna("").str.contains(vendor_keyword, case=False, na=False)
-            ]
+order_level["분석고객키"] = order_level["전화포함고객키"] if use_phone else order_level["고객키"]
 
-        if status_filter != "전체":
-            filtered = filtered[filtered["상태"] == status_filter]
+customer = (
+    order_level.groupby("분석고객키", dropna=False)
+    .agg({
+        "수취인": "first",
+        "수취인전화": "first",
+        "주소": "first",
+        "주문번호": pd.Series.nunique,
+        "주문일": ["min", "max"],
+        "결제금액": "sum",
+        "총수량": "sum",
+        "판매채널": join_unique,
+        "상품명": join_unique,
+    })
+)
 
-        if sort_option == "가격 높은순":
-            filtered = filtered.sort_values("매입가", ascending=False)
-        elif sort_option == "상승률 높은순":
-            filtered = filtered.sort_values("변동률", ascending=False, na_position="last")
-        elif sort_option == "하락률 높은순":
-            filtered = filtered.sort_values("변동률", ascending=True, na_position="last")
-        else:
-            filtered = filtered.sort_values(["매입일", "id"], ascending=[False, False])
+customer.columns = [
+    "고객명", "전화번호", "주소", "총주문횟수", "첫구매일", "최근구매일",
+    "누적구매금액", "누적수량", "이용채널", "구매상품"
+]
+customer = customer.reset_index(drop=True)
 
-        show_df = filtered.copy()
-        show_df["매입가"] = show_df["매입가"].apply(format_money)
-        show_df["직전매입가"] = show_df["직전매입가"].apply(format_money)
-        show_df["변동금액"] = show_df["변동금액"].apply(format_money)
-        show_df["변동률"] = show_df["변동률"].apply(format_percent)
+customer["고객구분"] = customer["총주문횟수"].apply(lambda x: "재구매" if x >= 2 else "신규")
+customer["고객등급"] = customer["총주문횟수"].apply(
+    lambda x: "VIP" if x >= 5 else "우수고객" if x >= 3 else "재구매" if x >= 2 else "신규"
+)
 
-        st.dataframe(
-            show_df.drop(columns=["id"]),
-            use_container_width=True,
-            hide_index=True
+today = pd.Timestamp.today().normalize()
+customer["최근구매후경과일"] = (today - pd.to_datetime(customer["최근구매일"]).dt.normalize()).dt.days
+customer["이탈위험"] = customer["최근구매후경과일"].apply(lambda x: "90일 이상 미구매" if x >= 90 else "")
+
+total_orders = len(order_level)
+total_customers = len(customer)
+repeat_customers = int((customer["총주문횟수"] >= 2).sum())
+new_customers = total_customers - repeat_customers
+repeat_rate = repeat_customers / total_customers * 100 if total_customers else 0
+avg_orders = customer["총주문횟수"].mean() if total_customers else 0
+
+cols = st.columns(5)
+kpis = [
+    ("전체 주문", f"{total_orders:,}건"),
+    ("전체 고객", f"{total_customers:,}명"),
+    ("신규 고객", f"{new_customers:,}명"),
+    ("재구매 고객", f"{repeat_customers:,}명"),
+    ("재구매율", f"{repeat_rate:.1f}%"),
+]
+for col, (title, val) in zip(cols, kpis):
+    with col:
+        st.markdown(f"""
+        <div class="kpi-card">
+            <div class="kpi-title">{title}</div>
+            <div class="kpi-value">{val}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+st.write("")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📊 대시보드", "👤 고객별 분석", "📦 주문 정리", "⬇️ 다운로드"])
+
+with tab1:
+    left, right = st.columns(2)
+
+    with left:
+        st.subheader("월별 주문 추이")
+        monthly = order_level.copy()
+        monthly["월"] = pd.to_datetime(monthly["주문일"]).dt.to_period("M").astype(str)
+        st.bar_chart(monthly.groupby("월").size())
+
+    with right:
+        st.subheader("구매횟수별 고객 수")
+        repeat_bucket = customer["총주문횟수"].apply(
+            lambda x: "1회" if x == 1 else "2회" if x == 2 else "3회" if x == 3 else "4회 이상"
         )
+        st.bar_chart(repeat_bucket.value_counts().reindex(["1회", "2회", "3회", "4회 이상"]).fillna(0))
 
-        csv = filtered.drop(columns=["id"]).to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "CSV 다운로드",
-            data=csv,
-            file_name=f"매입가_기록_{date.today().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("채널별 주문 수")
+        st.dataframe(order_level.groupby("판매채널").size().reset_index(name="주문수"), use_container_width=True, hide_index=True)
+    with c2:
+        st.subheader("고객 등급")
+        st.dataframe(customer["고객등급"].value_counts().reset_index().rename(columns={"index": "등급", "고객등급": "고객수"}), use_container_width=True, hide_index=True)
 
-        with st.expander("기록 삭제"):
-            delete_id = st.number_input(
-                "삭제할 ID 입력",
-                min_value=1,
-                step=1,
-                help="표에는 ID가 숨겨져 있습니다. 필요하면 아래 원본 ID 표를 열어서 확인하세요."
-            )
-            if st.button("선택 ID 삭제"):
-                delete_record(delete_id)
-                st.success("삭제 완료. 새로고침하면 반영됩니다.")
+with tab2:
+    st.subheader("고객별 구매 분석")
+    grade_filter = st.multiselect(
+        "고객등급 필터",
+        options=sorted(customer["고객등급"].unique()),
+        default=sorted(customer["고객등급"].unique()),
+    )
+    view = customer[customer["고객등급"].isin(grade_filter)].sort_values(["총주문횟수", "최근구매일"], ascending=[False, False])
+    st.dataframe(view, use_container_width=True, hide_index=True)
 
-            st.caption("원본 ID 확인용")
-            st.dataframe(df[["id", "매입일", "품목명", "규격단위", "매입가", "거래처명"]], hide_index=True)
+with tab3:
+    st.subheader("주문 단위 정리")
+    st.dataframe(order_level.sort_values("주문일", ascending=False), use_container_width=True, hide_index=True)
 
+with tab4:
+    summary = pd.DataFrame({
+        "항목": ["전체 주문", "전체 고객", "신규 고객", "재구매 고객", "재구매율", "평균 주문횟수"],
+        "값": [total_orders, total_customers, new_customers, repeat_customers, f"{repeat_rate:.1f}%", f"{avg_orders:.2f}회"]
+    })
 
-# -----------------------------
-# 분석 탭
-# -----------------------------
-with tab_dashboard:
-    st.subheader("가격 분석")
+    excel_bytes = to_excel_bytes(order_level, customer, summary)
+    st.download_button(
+        "분석 결과 엑셀 다운로드",
+        data=excel_bytes,
+        file_name=f"customer_repurchase_result_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-    df = load_records()
-
-    if df.empty:
-        st.info("분석할 기록이 없습니다.")
-    else:
-        total_count = len(df)
-        up_count = int((df["상태"] == "상승").sum())
-        down_count = int((df["상태"] == "하락").sum())
-        new_count = int((df["상태"] == "신규").sum())
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("전체 기록", f"{total_count:,}건")
-        m2.metric("상승 기록", f"{up_count:,}건")
-        m3.metric("하락 기록", f"{down_count:,}건")
-        m4.metric("신규 기록", f"{new_count:,}건")
-
-        st.divider()
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.markdown("#### 상승률 TOP 10")
-            top_up = df[df["상태"] == "상승"].sort_values("변동률", ascending=False).head(10)
-            if top_up.empty:
-                st.caption("상승 기록 없음")
-            else:
-                st.dataframe(
-                    top_up[["매입일", "품목명", "규격단위", "거래처명", "매입가", "직전매입가", "변동률"]],
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-        with c2:
-            st.markdown("#### 하락률 TOP 10")
-            top_down = df[df["상태"] == "하락"].sort_values("변동률", ascending=True).head(10)
-            if top_down.empty:
-                st.caption("하락 기록 없음")
-            else:
-                st.dataframe(
-                    top_down[["매입일", "품목명", "규격단위", "거래처명", "매입가", "직전매입가", "변동률"]],
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-        st.divider()
-
-        st.markdown("#### 품목별 가격 흐름")
-
-        item_options = sorted(df["품목명"].dropna().unique().tolist())
-        selected_item = st.selectbox("품목 선택", item_options)
-
-        item_df = df[df["품목명"] == selected_item].copy()
-        item_df["매입일"] = pd.to_datetime(item_df["매입일"])
-        item_df = item_df.sort_values("매입일")
-
-        if len(item_df) >= 2:
-            chart_df = item_df[["매입일", "매입가"]].set_index("매입일")
-            st.line_chart(chart_df)
-        else:
-            st.caption("그래프를 보려면 같은 품목 기록이 2개 이상 필요합니다.")
-
-        st.dataframe(
-            item_df[["매입일", "품목명", "규격단위", "매입가", "거래처명", "변동금액", "변동률", "상태", "메모"]],
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-st.caption("기준: 같은 품목명 + 같은 규격/단위 + 같은 거래처명 기준으로 직전 매입가와 비교합니다.")
+    st.caption("앱은 업로드 파일을 따로 저장하지 않습니다.")
