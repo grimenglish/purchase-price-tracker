@@ -4,6 +4,8 @@ from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 
 
 APP_TITLE = "매입가 변동 관리"
@@ -134,17 +136,6 @@ footer {visibility: hidden;}
     box-shadow: 0 8px 22px rgba(16, 24, 40, 0.04);
 }
 
-.item-chip {
-    display: inline-block;
-    padding: 6px 10px;
-    margin: 0 6px 8px 0;
-    border-radius: 999px;
-    background: #f2f4f7;
-    color: #344054;
-    font-size: 0.86rem;
-    border: 1px solid #eaecf0;
-}
-
 .small-muted {
     color: var(--muted);
     font-size: 0.88rem;
@@ -161,6 +152,19 @@ footer {visibility: hidden;}
     color: var(--muted);
     font-size: 0.9rem;
     margin-bottom: 15px;
+}
+
+.chart-title {
+    font-weight: 800;
+    font-size: 1.03rem;
+    margin-bottom: 2px;
+    color: #182230;
+}
+
+.chart-subtitle {
+    color: #667085;
+    font-size: 0.86rem;
+    margin-bottom: 10px;
 }
 
 .stTabs [data-baseweb="tab-list"] {
@@ -296,9 +300,6 @@ def calculate_change(current_price, previous_price):
 
 
 def find_previous_price(item_name, purchase_date):
-    """
-    같은 품목명 기준으로 직전 매입가를 비교합니다.
-    """
     conn = get_conn()
     cur = conn.cursor()
 
@@ -320,9 +321,6 @@ def find_previous_price(item_name, purchase_date):
 
 
 def recalculate_all_changes():
-    """
-    기존 저장된 기록도 같은 품목 기준으로 자동 재계산합니다.
-    """
     conn = get_conn()
     cur = conn.cursor()
 
@@ -427,6 +425,12 @@ def load_records():
         ORDER BY purchase_date DESC, id DESC
     """, conn)
     conn.close()
+
+    if not df.empty:
+        df["매입일_dt"] = pd.to_datetime(df["매입일"], errors="coerce")
+        df["월"] = df["매입일_dt"].dt.strftime("%Y-%m")
+        df["품목표시"] = df["품목명"].apply(lambda x: f"{ITEM_ICONS.get(x, '•')} {x}")
+
     return df
 
 
@@ -483,11 +487,48 @@ def make_display_df(df):
     return show_df[cols]
 
 
-def latest_by_item(df):
+def latest_item_rows(df):
     rows = []
     for item in ITEM_CATEGORIES:
         item_df = df[df["품목명"] == item].copy()
         if item_df.empty:
+            continue
+
+        item_df = item_df.sort_values(["매입일", "id"], ascending=[False, False])
+        row = item_df.iloc[0]
+        rows.append({
+            "품목명": item,
+            "품목": f"{ITEM_ICONS.get(item, '•')} {item}",
+            "최근 매입일": row["매입일"],
+            "최근 매입가": row["매입가"],
+            "직전매입가": row["직전매입가"],
+            "변동금액": row["변동금액"],
+            "변동률": row["변동률"],
+            "상태": row["상태"],
+            "거래처명": row["거래처명"] if row["거래처명"] else "-",
+        })
+
+    return pd.DataFrame(rows)
+
+
+def latest_by_item_display(df):
+    rows = []
+    latest_df = latest_item_rows(df)
+
+    existing = set(latest_df["품목명"].tolist()) if not latest_df.empty else set()
+
+    for item in ITEM_CATEGORIES:
+        if item in existing:
+            row = latest_df[latest_df["품목명"] == item].iloc[0]
+            rows.append({
+                "품목": f"{ITEM_ICONS.get(item, '•')} {item}",
+                "최근 매입일": row["최근 매입일"],
+                "최근 매입가": format_money(row["최근 매입가"]),
+                "직전 대비": format_percent(row["변동률"]),
+                "상태": STATUS_ICON.get(row["상태"], row["상태"]),
+                "거래처명": row["거래처명"],
+            })
+        else:
             rows.append({
                 "품목": f"{ITEM_ICONS.get(item, '•')} {item}",
                 "최근 매입일": "-",
@@ -496,18 +537,227 @@ def latest_by_item(df):
                 "상태": "-",
                 "거래처명": "-",
             })
-        else:
-            item_df = item_df.sort_values(["매입일", "id"], ascending=[False, False])
-            row = item_df.iloc[0]
-            rows.append({
-                "품목": f"{ITEM_ICONS.get(item, '•')} {item}",
-                "최근 매입일": row["매입일"],
-                "최근 매입가": format_money(row["매입가"]),
-                "직전 대비": format_percent(row["변동률"]),
-                "상태": STATUS_ICON.get(row["상태"], row["상태"]),
-                "거래처명": row["거래처명"] if row["거래처명"] else "-",
-            })
     return pd.DataFrame(rows)
+
+
+def base_fig_layout(fig, height=360):
+    fig.update_layout(
+        height=height,
+        margin=dict(l=20, r=20, t=35, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Arial, sans-serif", size=13),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor="rgba(16, 24, 40, 0.08)")
+    return fig
+
+
+def render_chart_header(title, subtitle):
+    st.markdown(f'<div class="chart-title">{title}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="chart-subtitle">{subtitle}</div>', unsafe_allow_html=True)
+
+
+def chart_latest_prices(df):
+    latest_df = latest_item_rows(df)
+    if latest_df.empty:
+        st.info("그래프를 만들 기록이 없습니다.")
+        return
+
+    fig = px.bar(
+        latest_df,
+        x="품목",
+        y="최근 매입가",
+        text=latest_df["최근 매입가"].apply(lambda x: f"{int(x):,}원"),
+        hover_data=["최근 매입일", "거래처명", "상태"],
+    )
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    fig.update_yaxes(title="최근 매입가", tickformat=",")
+    fig.update_xaxes(title=None)
+    fig = base_fig_layout(fig, height=390)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_latest_change_rate(df):
+    latest_df = latest_item_rows(df)
+    latest_df = latest_df.dropna(subset=["변동률"])
+
+    if latest_df.empty:
+        st.info("상승/하락 비교를 보려면 같은 품목 기록이 2개 이상 필요합니다.")
+        return
+
+    fig = px.bar(
+        latest_df,
+        x="품목",
+        y="변동률",
+        color="상태",
+        text=latest_df["변동률"].apply(lambda x: f"{x:+.2f}%"),
+        hover_data=["최근 매입일", "최근 매입가", "직전매입가", "변동금액"],
+        color_discrete_map={
+            "상승": "#d92d20",
+            "하락": "#1570ef",
+            "동일": "#667085",
+            "신규": "#12b76a",
+        },
+    )
+    fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="#98a2b3")
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    fig.update_yaxes(title="직전 대비 변동률", ticksuffix="%")
+    fig.update_xaxes(title=None)
+    fig = base_fig_layout(fig, height=390)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_status_pie(df):
+    status_df = df["상태"].value_counts().reset_index()
+    status_df.columns = ["상태", "건수"]
+    status_df["상태표시"] = status_df["상태"].map(STATUS_ICON).fillna(status_df["상태"])
+
+    fig = px.pie(
+        status_df,
+        names="상태표시",
+        values="건수",
+        hole=0.48,
+    )
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig = base_fig_layout(fig, height=340)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_count_by_item(df):
+    count_df = df.groupby("품목명", as_index=False).size()
+    count_df["품목"] = count_df["품목명"].apply(lambda x: f"{ITEM_ICONS.get(x, '•')} {x}")
+    count_df = count_df.sort_values("size", ascending=False)
+
+    fig = px.bar(
+        count_df,
+        x="품목",
+        y="size",
+        text="size",
+    )
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    fig.update_yaxes(title="기록 수")
+    fig.update_xaxes(title=None)
+    fig = base_fig_layout(fig, height=340)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_item_trend(df, selected_item):
+    item_df = df[df["품목명"] == selected_item].copy()
+    item_df = item_df.sort_values(["매입일_dt", "id"])
+
+    if len(item_df) < 2:
+        st.info("가격 흐름 그래프를 보려면 같은 품목 기록이 2개 이상 필요합니다.")
+        return
+
+    fig = px.line(
+        item_df,
+        x="매입일_dt",
+        y="매입가",
+        markers=True,
+        hover_data=["거래처명", "규격단위", "변동률", "메모"],
+    )
+    fig.update_traces(line_width=3, marker_size=9)
+    fig.update_xaxes(title="매입일")
+    fig.update_yaxes(title="매입가", tickformat=",")
+    fig = base_fig_layout(fig, height=390)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_monthly_average(df, selected_item):
+    item_df = df[df["품목명"] == selected_item].copy()
+
+    if item_df.empty:
+        st.info("월별 평균을 계산할 기록이 없습니다.")
+        return
+
+    monthly = (
+        item_df
+        .dropna(subset=["월"])
+        .groupby("월", as_index=False)
+        .agg(평균매입가=("매입가", "mean"), 기록수=("id", "count"))
+        .sort_values("월")
+    )
+
+    if len(monthly) < 2:
+        st.info("월별 추세를 보려면 2개월 이상 기록이 필요합니다.")
+        return
+
+    fig = px.line(
+        monthly,
+        x="월",
+        y="평균매입가",
+        markers=True,
+        hover_data=["기록수"],
+    )
+    fig.update_traces(line_width=3, marker_size=9)
+    fig.update_xaxes(title="월")
+    fig.update_yaxes(title="월 평균 매입가", tickformat=",")
+    fig = base_fig_layout(fig, height=340)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_vendor_latest_price(df, selected_item):
+    item_df = df[df["품목명"] == selected_item].copy()
+
+    if item_df.empty:
+        st.info("거래처별 비교를 만들 기록이 없습니다.")
+        return
+
+    item_df["거래처명_clean"] = item_df["거래처명"].fillna("").replace("", "미입력")
+    item_df = item_df.sort_values(["거래처명_clean", "매입일_dt", "id"], ascending=[True, False, False])
+    latest_vendor = item_df.drop_duplicates(subset=["거래처명_clean"], keep="first")
+    latest_vendor = latest_vendor.sort_values("매입가", ascending=False).head(10)
+
+    if latest_vendor.empty:
+        st.info("거래처 정보가 부족합니다.")
+        return
+
+    fig = px.bar(
+        latest_vendor,
+        x="거래처명_clean",
+        y="매입가",
+        text=latest_vendor["매입가"].apply(lambda x: f"{int(x):,}원"),
+        hover_data=["매입일", "규격단위", "메모"],
+    )
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    fig.update_xaxes(title="거래처")
+    fig.update_yaxes(title="최근 매입가", tickformat=",")
+    fig = base_fig_layout(fig, height=340)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def chart_change_amount_waterfall(df, selected_item):
+    item_df = df[df["품목명"] == selected_item].copy()
+    item_df = item_df.sort_values(["매입일_dt", "id"])
+    item_df = item_df.dropna(subset=["변동금액"])
+
+    if item_df.empty:
+        st.info("변동금액 그래프를 보려면 같은 품목 기록이 2개 이상 필요합니다.")
+        return
+
+    labels = item_df["매입일"].tolist()
+    values = item_df["변동금액"].tolist()
+
+    fig = go.Figure(go.Bar(
+        x=labels,
+        y=values,
+        text=[format_change_money(v) for v in values],
+        textposition="outside",
+        hovertemplate="매입일=%{x}<br>변동금액=%{y:,}원<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="#98a2b3")
+    fig.update_xaxes(title="매입일")
+    fig.update_yaxes(title="직전 대비 변동금액", tickformat=",")
+    fig = base_fig_layout(fig, height=340)
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def render_record_table(source_df, tab_key, fixed_item=None):
@@ -573,7 +823,7 @@ def render_record_table(source_df, tab_key, fixed_item=None):
     )
 
     csv_name_item = fixed_item if fixed_item and fixed_item != "전체" else "전체"
-    csv = filtered.drop(columns=["id"]).to_csv(index=False).encode("utf-8-sig")
+    csv = filtered.drop(columns=["id", "매입일_dt", "월", "품목표시"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         f"{csv_name_item} CSV 다운로드",
         data=csv,
@@ -611,7 +861,7 @@ with st.sidebar:
     st.info("같은 품목명 기준으로 직전 매입가와 비교합니다.")
 
     st.markdown("#### 사용 순서")
-    st.caption("1. 매입 기록 입력 → 2. 품목별 조회 → 3. 가격 분석 확인")
+    st.caption("1. 매입 등록 → 2. 품목별 조회 → 3. 가격 분석")
 
 
 # -----------------------------
@@ -625,8 +875,8 @@ st.markdown(
         <div class="hero-badges">
             <span class="badge">품목별 탭 분리</span>
             <span class="badge">직전가 자동 비교</span>
+            <span class="badge">그래프 대시보드</span>
             <span class="badge">CSV 다운로드</span>
-            <span class="badge">가격 흐름 분석</span>
         </div>
     </div>
     """,
@@ -726,23 +976,24 @@ with tab_input:
         st.markdown('<div class="card-title">최근 품목별 단가</div>', unsafe_allow_html=True)
         st.markdown('<div class="card-subtitle">현재 가장 최신으로 저장된 매입가입니다.</div>', unsafe_allow_html=True)
 
-        if df.empty:
+        current_df = load_records()
+        if current_df.empty:
             st.info("아직 저장된 기록이 없습니다.")
         else:
             st.dataframe(
-                latest_by_item(load_records()),
+                latest_by_item_display(current_df),
                 use_container_width=True,
                 hide_index=True
             )
 
         st.markdown("#### 빠른 확인")
-        if df.empty:
+        if current_df.empty:
             st.caption("기록을 넣으면 상승/하락 현황이 표시됩니다.")
         else:
-            today_count = int((pd.to_datetime(df["매입일"]).dt.date == date.today()).sum())
-            total_count = len(df)
-            up_count = int((df["상태"] == "상승").sum())
-            down_count = int((df["상태"] == "하락").sum())
+            today_count = int((pd.to_datetime(current_df["매입일"]).dt.date == date.today()).sum())
+            total_count = len(current_df)
+            up_count = int((current_df["상태"] == "상승").sum())
+            down_count = int((current_df["상태"] == "하락").sum())
 
             m1, m2 = st.columns(2)
             m1.metric("오늘 입력", f"{today_count:,}건")
@@ -802,7 +1053,7 @@ with tab_list:
 # -----------------------------
 with tab_dashboard:
     st.markdown('<div class="card-title">가격 분석 대시보드</div>', unsafe_allow_html=True)
-    st.markdown('<div class="card-subtitle">최근 단가, 상승/하락 품목, 품목별 가격 흐름을 한눈에 확인합니다.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card-subtitle">최근 단가, 상승/하락률, 거래처별 가격, 월별 흐름을 그래프로 확인합니다.</div>', unsafe_allow_html=True)
 
     df = load_records()
 
@@ -812,76 +1063,97 @@ with tab_dashboard:
         total_count = len(df)
         up_count = int((df["상태"] == "상승").sum())
         down_count = int((df["상태"] == "하락").sum())
-        new_count = int((df["상태"] == "신규").sum())
+        same_count = int((df["상태"] == "동일").sum())
+
+        latest_numeric = latest_item_rows(df)
+        avg_latest_price = latest_numeric["최근 매입가"].mean() if not latest_numeric.empty else 0
+        max_change_row = latest_numeric.dropna(subset=["변동률"]).sort_values("변동률", ascending=False).head(1)
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("전체 기록", f"{total_count:,}건")
         m2.metric("상승 기록", f"{up_count:,}건")
         m3.metric("하락 기록", f"{down_count:,}건")
-        m4.metric("신규 기록", f"{new_count:,}건")
+        m4.metric("최근 단가 평균", format_money(avg_latest_price))
+
+        if not max_change_row.empty:
+            row = max_change_row.iloc[0]
+            st.info(f"현재 가장 많이 오른 품목: {row['품목']} / 직전 대비 {format_percent(row['변동률'])}")
 
         st.divider()
 
-        st.markdown("#### 품목별 최근 매입가")
-        st.dataframe(
-            latest_by_item(df),
-            use_container_width=True,
-            hide_index=True
-        )
+        st.markdown("#### 한눈에 보는 전체 현황")
+        a1, a2 = st.columns([1.25, 1], gap="large")
+
+        with a1:
+            render_chart_header("품목별 최근 매입가", "각 품목의 가장 최근 매입가를 비교합니다.")
+            chart_latest_prices(df)
+
+        with a2:
+            render_chart_header("최근 변동률", "각 품목의 직전 매입가 대비 상승/하락률입니다.")
+            chart_latest_change_rate(df)
 
         st.divider()
 
-        c1, c2 = st.columns(2, gap="large")
+        b1, b2 = st.columns([1, 1], gap="large")
 
-        with c1:
-            st.markdown("#### 상승률 TOP 10")
-            top_up = df[df["상태"] == "상승"].sort_values("변동률", ascending=False).head(10)
-            if top_up.empty:
-                st.caption("상승 기록 없음")
-            else:
-                st.dataframe(
-                    make_display_df(top_up),
-                    use_container_width=True,
-                    hide_index=True
-                )
+        with b1:
+            render_chart_header("상태 비중", "전체 기록 중 상승·하락·신규 비중입니다.")
+            chart_status_pie(df)
 
-        with c2:
-            st.markdown("#### 하락률 TOP 10")
-            top_down = df[df["상태"] == "하락"].sort_values("변동률", ascending=True).head(10)
-            if top_down.empty:
-                st.caption("하락 기록 없음")
-            else:
-                st.dataframe(
-                    make_display_df(top_down),
-                    use_container_width=True,
-                    hide_index=True
-                )
+        with b2:
+            render_chart_header("품목별 기록 수", "어떤 품목을 가장 자주 기록했는지 보여줍니다.")
+            chart_count_by_item(df)
 
         st.divider()
 
-        st.markdown("#### 품목별 가격 흐름")
-
+        st.markdown("#### 품목 상세 분석")
         selected_item = st.selectbox(
-            "품목 선택",
+            "분석할 품목 선택",
             ITEM_CATEGORIES,
             format_func=lambda x: f"{ITEM_ICONS.get(x, '')} {x}"
         )
 
-        item_df = df[df["품목명"] == selected_item].copy()
-        item_df["매입일"] = pd.to_datetime(item_df["매입일"])
-        item_df = item_df.sort_values(["매입일", "id"])
-
-        if len(item_df) >= 2:
-            chart_df = item_df[["매입일", "매입가"]].set_index("매입일")
-            st.line_chart(chart_df)
+        selected_df = df[df["품목명"] == selected_item].copy()
+        if selected_df.empty:
+            st.info("선택한 품목 기록이 없습니다.")
         else:
-            st.caption("그래프를 보려면 같은 품목 기록이 2개 이상 필요합니다.")
+            selected_df = selected_df.sort_values(["매입일", "id"], ascending=[False, False])
+            latest_row = selected_df.iloc[0]
 
-        st.dataframe(
-            make_display_df(item_df),
-            use_container_width=True,
-            hide_index=True
-        )
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("최근 매입가", format_money(latest_row["매입가"]))
+            s2.metric("직전 매입가", format_money(latest_row["직전매입가"]))
+            s3.metric("변동금액", format_change_money(latest_row["변동금액"]))
+            s4.metric("변동률", format_percent(latest_row["변동률"]))
+
+            c1, c2 = st.columns([1.25, 1], gap="large")
+
+            with c1:
+                render_chart_header(f"{ITEM_ICONS.get(selected_item, '')} {selected_item} 가격 흐름", "입력한 매입일 순서대로 가격 변화를 보여줍니다.")
+                chart_item_trend(df, selected_item)
+
+            with c2:
+                render_chart_header("거래처별 최근 매입가", "같은 품목을 거래처별 최근 가격으로 비교합니다.")
+                chart_vendor_latest_price(df, selected_item)
+
+            d1, d2 = st.columns([1, 1], gap="large")
+
+            with d1:
+                render_chart_header("월별 평균 매입가", "월 단위로 평균 매입가 흐름을 봅니다.")
+                chart_monthly_average(df, selected_item)
+
+            with d2:
+                render_chart_header("직전 대비 변동금액", "매입 때마다 얼마 올랐고 내렸는지 봅니다.")
+                chart_change_amount_waterfall(df, selected_item)
+
+            st.divider()
+
+            st.markdown("#### 선택 품목 상세 기록")
+            st.dataframe(
+                make_display_df(selected_df),
+                use_container_width=True,
+                hide_index=True
+            )
 
 
 st.caption("비교 기준: 같은 품목명 기준으로 직전 매입가와 비교합니다.")
